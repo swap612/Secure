@@ -1,0 +1,184 @@
+diff -Naru ChampSim-master_orig/inc/ooo_cpu.h ChampSim-master/inc/ooo_cpu.h
+--- ChampSim-master_orig/inc/ooo_cpu.h	2018-01-23 23:23:54.000000000 +0530
++++ ChampSim-master/inc/ooo_cpu.h	2018-10-19 00:49:18.300389000 +0530
+@@ -82,6 +82,8 @@
+           L1D{"L1D", L1D_SET, L1D_WAY, L1D_SET*L1D_WAY, L1D_WQ_SIZE, L1D_RQ_SIZE, L1D_PQ_SIZE, L1D_MSHR_SIZE},
+           L2C{"L2C", L2C_SET, L2C_WAY, L2C_SET*L2C_WAY, L2C_WQ_SIZE, L2C_RQ_SIZE, L2C_PQ_SIZE, L2C_MSHR_SIZE};
+ 
++    int L1_BackHitCount, L2_BackHitCount;
++
+     // constructor
+     O3_CPU() {
+         cpu = 0;
+@@ -150,6 +152,11 @@
+         RTS1_head = 0;
+         RTS0_tail = 0;
+         RTS1_tail = 0;
++
++        //L1, L2 WB count 
++        L1_BackHitCount = 0;
++        L2_BackHitCount = 0;
++        
+     }
+ 
+     // functions
+diff -Naru ChampSim-master_orig/run_champsim.sh ChampSim-master/run_champsim.sh
+--- ChampSim-master_orig/run_champsim.sh	1970-01-01 05:30:00.000000000 +0530
++++ ChampSim-master/run_champsim.sh	2018-10-19 15:37:42.499994000 +0530
+@@ -0,0 +1,9 @@
++TRACE_DIR=../Traces
++binary=${1}
++n_warm=${2}
++n_sim=${3}
++trace=${4}
++option=${5}
++
++mkdir -p results_${n_sim}M
++(./bin/${binary} -warmup_instructions ${n_warm}000000 -simulation_instructions ${n_sim}000000 ${option} -traces ${TRACE_DIR}/${trace}.trace.gz) &> results_${n_sim}M/${trace}-${binary}${option}.txt
+diff -Naru ChampSim-master_orig/src/cache.cc ChampSim-master/src/cache.cc
+--- ChampSim-master_orig/src/cache.cc	2018-01-23 23:23:54.000000000 +0530
++++ ChampSim-master/src/cache.cc	2018-10-19 11:37:13.565055000 +0530
+@@ -1,5 +1,6 @@
+ #include "cache.h"
+ #include "set.h"
++#include "ooo_cpu.h" 
+ 
+ uint64_t l2pf_access = 0;
+ 
+@@ -18,14 +19,73 @@
+ #endif
+ 
+         uint32_t mshr_index = MSHR.next_fill_index;
+-
++         
++        uint64_t inval_addr;
++        int isInvalidated = -1, foundInL2 = 0;
++        
+         // find victim
+         uint32_t set = get_set(MSHR.entry[mshr_index].address), way;
+         if (cache_type == IS_LLC) {
+             way = llc_find_victim(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
++            
++            //check if the block is valid, if yes then check at upper levels
++            if (block[set][way].valid != false) {
++
++                inval_addr = block[set][way].address;
++                //Make the cache Inclusive by invalidating the inval_addr from upper levels            
++                for (int i = 0; i < NUM_CPUS; i++)
++                {
++                    //Is invalidated in L2
++                    isInvalidated = ooo_cpu[i].L2C.invalidate_entry(inval_addr);
++                    //if the block was present in L2 invalidate check and invalidate L1
++                    if(isInvalidated != -1){
++                        
++                        if(!foundInL2)
++                            ooo_cpu[i].L2_BackHitCount++;
++
++                        //Invalidate L1D                   
++                        isInvalidated = ooo_cpu[i].L1D.invalidate_entry(inval_addr);
++                        if(isInvalidated != -1)
++                            ooo_cpu[i].L1_BackHitCount++;
++                        
++                        //Invalidate L1I
++                        isInvalidated = ooo_cpu[i].L1I.invalidate_entry(inval_addr);
++                        if(isInvalidated != -1)
++                            ooo_cpu[i].L1_BackHitCount++;
++
++                        foundInL2 = 1;
++                    }
++
++                }
++            }
+         }
+-        else
++        
++        else if(cache_type == IS_L2C) {
++            //find_victim
+             way = find_victim(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
++            
++            if (block[set][way].valid != false) {
++                //get block addr to be invalidated
++                inval_addr = block[set][way].address;
++                
++                //Make the cache Inclusive by invalidating the inval_addr from upper levels
++                //Invalidate L1D
++                isInvalidated = ooo_cpu[fill_cpu].L1D.invalidate_entry(inval_addr);
++                if(isInvalidated != -1)
++                    ooo_cpu[fill_cpu].L1_BackHitCount++;
++
++                //Invalidate L1I    
++                isInvalidated = ooo_cpu[fill_cpu].L1I.invalidate_entry(inval_addr);
++                if(isInvalidated != -1)
++                    ooo_cpu[fill_cpu].L1_BackHitCount++;
++            }
++        }
++        else {
++            //find_victim
++            way = find_victim(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
++           
++        }
++
+ 
+ #ifdef LLC_BYPASS
+         if ((cache_type == IS_LLC) && (way == LLC_WAY)) { // this is a bypass that does not fill the LLC
+@@ -873,7 +933,8 @@
+ int CACHE::invalidate_entry(uint64_t inval_addr)
+ {
+     uint32_t set = get_set(inval_addr);
+-    int match_way = -1;
++    int match_way = -1;   
++
+ 
+     if (NUM_SET < set) {
+         cerr << "[" << NAME << "_ERROR] " << __func__ << " invalid set index: " << set << " NUM_SET: " << NUM_SET;
+diff -Naru ChampSim-master_orig/src/main.cc ChampSim-master/src/main.cc
+--- ChampSim-master_orig/src/main.cc	2018-01-23 23:23:54.000000000 +0530
++++ ChampSim-master/src/main.cc	2018-10-19 13:18:04.309032000 +0530
+@@ -446,6 +446,18 @@
+     return pa;
+ }
+ 
++//Solution: PA-2_1
++void print_backhit_stats(){
++ 
++    for (int i=0; i<NUM_CPUS; i++) {
++        cout<<"\nPrinting BackHits Stats of CPU "<<i;
++        cout<<"\nL1 BackHit: "<<ooo_cpu[i].L1_BackHitCount;
++        cout<<"\tL2 BackHit: "<<ooo_cpu[i].L2_BackHitCount;
++    }
++    cout<<endl;
++}
++
++
+ int main(int argc, char** argv)
+ {
+ 	// interrupt signal hanlder
+@@ -844,9 +856,18 @@
+             print_sim_stats(i, &uncore.LLC);
+         }
+     }
+-
++    
++    //Printing Backhits count
++    print_backhit_stats();
++    
+     cout << endl << "Region of Interest Statistics" << endl;
+-    for (uint32_t i=0; i<NUM_CPUS; i++) {
++    for (uint32_t i=0; i<NUM_CPUS; i++){
++        // //printing L1WB, L2WB
++        // cout<<"\n Printing WriteBack Stats";
++        // cout<<"\n L1 WB: "<<ooo_cpu[i].L1_WriteBackCount;
++        // cout<<"\t L2 WB: "<<ooo_cpu[i].L2_WriteBackCount;
++
++
+         cout << endl << "CPU " << i << " cumulative IPC: " << ((float) ooo_cpu[i].finish_sim_instr / ooo_cpu[i].finish_sim_cycle); 
+         cout << " instructions: " << ooo_cpu[i].finish_sim_instr << " cycles: " << ooo_cpu[i].finish_sim_cycle << endl;
+ #ifndef CRC2_COMPILE
+@@ -868,5 +889,7 @@
+     print_dram_stats();
+ #endif
+ 
++    // print_backhit_stats();
++
+     return 0;
+ }
