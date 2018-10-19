@@ -1,0 +1,143 @@
+#include "cache.h"
+#include "ooo_cpu.h"
+// initialize replacement state
+void CACHE::llc_initialize_replacement()
+{
+
+}
+
+// find replacement victim
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    uint32_t way = 0;
+
+    // fill invalid line first
+    
+    for (way = 0; way < NUM_WAY; way++)
+    {
+        if (block[set][way].valid == false)
+        {
+
+            DP(if (warmup_complete[cpu]) {
+            cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " invalid set: " << set << " way: " << way;
+            cout << hex << " address: " << (full_addr>>LOG2_BLOCK_SIZE) << " victim address: " << block[set][way].address << " data: " << block[set][way].data;
+            cout << dec << " lru: " << block[set][way].lru << endl; });
+            return way;
+        }
+    }
+
+       int Found_in_Upper_Levels, max_lru_no_private=-1, max_lru_way_no_private=-1,current_cpu,exist_in_upper_levels,cpu_count,my_cpu,flagUpper=0,max_lru_private=-1, max_lru_way_private=-1,Flag_not_in_L2=0,Flag_in_my_L2_only=0;
+        if(way==NUM_WAY)
+         { 
+            for (way = 0; way < NUM_WAY; way++)
+            { 
+                exist_in_upper_levels=0;cpu_count=0;my_cpu=0;
+                for(current_cpu=0;current_cpu<NUM_CPUS;current_cpu++)   
+                 {  //Search a given LLC Block in all L2 caches
+                 Found_in_Upper_Levels=(ooo_cpu[current_cpu].L2C.search_entry(block[set][way].address));
+                 
+                 if(Found_in_Upper_Levels) 
+                    {   //Set flag that LLC block is found in some L2,increment cpu_count that store no of L2 that contain that block      
+                           exist_in_upper_levels=1;    cpu_count++;
+                           //check if LLC block exist in same processor's L2 cache which is calling find victim
+                                  if(current_cpu==(int)cpu) my_cpu=1;
+                    }
+
+
+            }
+            
+              if(exist_in_upper_levels==0)
+              //CASE 1:find oldest LRU block from the blocks that are only in LLC
+               { Flag_not_in_L2=1;
+                   
+                   if (max_lru_no_private < (int) block[set][way].lru)
+                    {
+                        max_lru_no_private = block[set][way].lru;
+                        max_lru_way_no_private = way;
+                    }
+                   
+               }
+               if(cpu_count==1 && my_cpu==1) {
+                   //CASE 2:find oldest LRU block from the blocks that are only in Caller processor L2
+                  Flag_in_my_L2_only=1;
+                   if (max_lru_private < (int) block[set][way].lru)
+                    {
+                        max_lru_private = block[set][way].lru;
+                        max_lru_way_private = way;
+                    }
+               
+                    
+                  }
+
+
+            }
+            //return way number depends on CASE 1 or CASE 2
+            if(Flag_not_in_L2)
+                return max_lru_way_no_private;
+            else if(Flag_in_my_L2_only)  
+                  return   max_lru_way_private; 
+                  
+            //run normal LRU if CASE 1 and CASE 2 is false
+            for (way=0; way<NUM_WAY; way++) {
+            if (block[set][way].lru == NUM_WAY-1) {
+                DP ( if (warmup_complete[cpu]) {
+                cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " replace set: " << set << " way: " << way;
+                cout << hex << " address: " << (full_addr>>LOG2_BLOCK_SIZE) << " victim address: " << block[set][way].address << " data: " << block[set][way].data;
+                cout << dec << " lru: " << block[set][way].lru << endl; });
+
+                break;
+            }
+        }
+        
+        
+           
+    } 
+              
+        if (way == NUM_WAY)
+        {
+            cerr << "[" << NAME << "] " << __func__ << " no victim! set: " << set << endl;
+            assert(0);
+        } 
+       
+        return way; 
+        
+}
+
+// called on every cache hit and cache fill
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // uncomment this line to see the LLC accesses
+    // cout << "CPU: " << cpu << "  LLC " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+
+    // baseline LRU
+    if (hit && (type == WRITEBACK)) // writeback hit does not update LRU state
+        return;
+
+    return lru_update(set, way);
+}
+
+void CACHE::llc_replacement_final_stats()
+{
+
+}
