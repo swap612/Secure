@@ -1,0 +1,803 @@
+diff -Naru ChampSim-master_orig/inc/cache.h ChampSim-master/inc/cache.h
+--- ChampSim-master_orig/inc/cache.h	2018-01-23 23:23:54.000000000 +0530
++++ ChampSim-master/inc/cache.h	2018-10-21 01:36:13.775937478 +0530
+@@ -174,6 +174,7 @@
+ 
+     int  check_hit(PACKET *packet),
+          invalidate_entry(uint64_t inval_addr),
++         search_entry(uint64_t inval_addr),
+          check_mshr(PACKET *packet),
+          prefetch_line(uint64_t ip, uint64_t base_addr, uint64_t pf_addr, int fill_level),
+          kpc_prefetch_line(uint64_t base_addr, uint64_t pf_addr, int fill_level, int delta, int depth, int signature, int confidence);
+diff -Naru ChampSim-master_orig/inc/ooo_cpu.h ChampSim-master/inc/ooo_cpu.h
+--- ChampSim-master_orig/inc/ooo_cpu.h	2018-01-23 23:23:54.000000000 +0530
++++ ChampSim-master/inc/ooo_cpu.h	2018-10-21 01:38:06.283937049 +0530
+@@ -82,6 +82,8 @@
+           L1D{"L1D", L1D_SET, L1D_WAY, L1D_SET*L1D_WAY, L1D_WQ_SIZE, L1D_RQ_SIZE, L1D_PQ_SIZE, L1D_MSHR_SIZE},
+           L2C{"L2C", L2C_SET, L2C_WAY, L2C_SET*L2C_WAY, L2C_WQ_SIZE, L2C_RQ_SIZE, L2C_PQ_SIZE, L2C_MSHR_SIZE};
+ 
++    int L1_BackHitCount, L2_BackHitCount, LLCEvictionCount, crossCoreEvictionCount;
++
+     // constructor
+     O3_CPU() {
+         cpu = 0;
+@@ -150,6 +152,13 @@
+         RTS1_head = 0;
+         RTS0_tail = 0;
+         RTS1_tail = 0;
++
++        //L1, L2 Backhit and LLC eviction count 
++        L1_BackHitCount = 0;
++        L2_BackHitCount = 0;
++        LLCEvictionCount = 0;
++        crossCoreEvictionCount = 0;
++
+     }
+ 
+     // functions
+diff -Naru ChampSim-master_orig/replacement/new_drrip.llc_repl ChampSim-master/replacement/new_drrip.llc_repl
+--- ChampSim-master_orig/replacement/new_drrip.llc_repl	1970-01-01 05:30:00.000000000 +0530
++++ ChampSim-master/replacement/new_drrip.llc_repl	2018-10-20 17:15:10.700475000 +0530
+@@ -0,0 +1,253 @@
++#include "cache.h"
++#include "ooo_cpu.h"
++#define maxRRPV 3
++#define NUM_POLICY 2
++#define SDM_SIZE 32
++#define TOTAL_SDM_SETS NUM_CPUS *NUM_POLICY *SDM_SIZE
++#define BIP_MAX 32
++#define PSEL_WIDTH 10
++#define PSEL_MAX ((1 << PSEL_WIDTH) - 1)
++#define PSEL_THRS PSEL_MAX / 2
++int Back_inv=0;
++
++uint32_t rrpv[LLC_SET][LLC_WAY],
++    bip_counter = 0,
++    PSEL[NUM_CPUS];
++unsigned rand_sets[TOTAL_SDM_SETS];
++
++void CACHE::llc_initialize_replacement()
++{
++    cout << "Initialize DRRIP state" << endl;
++
++    for (int i = 0; i < LLC_SET; i++)
++    {
++        for (int j = 0; j < LLC_WAY; j++)
++            rrpv[i][j] = maxRRPV;
++    }
++
++    // randomly selected sampler sets
++    srand(time(NULL));
++    unsigned long rand_seed = 1;
++    unsigned long max_rand = 1048576;
++    uint32_t my_set = LLC_SET;
++    int do_again = 0;
++    for (int i = 0; i < TOTAL_SDM_SETS; i++)
++    {
++        do
++        {
++            do_again = 0;
++            rand_seed = rand_seed * 1103515245 + 12345;
++            rand_sets[i] = ((unsigned)((rand_seed / 65536) % max_rand)) % my_set;
++            printf("Assign rand_sets[%d]: %u  LLC: %u\n", i, rand_sets[i], my_set);
++            for (int j = 0; j < i; j++)
++            {
++                if (rand_sets[i] == rand_sets[j])
++                {
++                    do_again = 1;
++                    break;
++                }
++            }
++        } while (do_again);
++        printf("rand_sets[%d]: %d\n", i, rand_sets[i]);
++    }
++
++    for (int i = 0; i < NUM_CPUS; i++)
++        PSEL[i] = 0;
++}
++
++int is_it_leader(uint32_t cpu, uint32_t set)
++{
++    uint32_t start = cpu * NUM_POLICY * SDM_SIZE,
++             end = start + NUM_POLICY * SDM_SIZE;
++
++    for (uint32_t i = start; i < end; i++)
++        if (rand_sets[i] == set)
++            return ((i - start) / SDM_SIZE);
++
++    return -1;
++}
++
++// called on every cache hit and cache fill
++void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
++{
++    // do not update replacement state for writebacks
++    if (type == WRITEBACK)
++    {
++        rrpv[set][way] = maxRRPV - 1;
++        return;
++    }
++
++    // cache hit
++    if (hit)
++    {
++        rrpv[set][way] = 0; // for cache hit, DRRIP always promotes a cache line to the MRU position
++        return;
++    }
++
++    // cache miss
++    int leader = is_it_leader(cpu, set);
++
++    if (leader == -1)
++    { // follower sets
++        if (PSEL[cpu] > PSEL_THRS)
++        { // follow BIP
++            rrpv[set][way] = maxRRPV;
++
++            bip_counter++;
++            if (bip_counter == BIP_MAX)
++                bip_counter = 0;
++            if (bip_counter == 0)
++                rrpv[set][way] = maxRRPV - 1;
++        }
++        else // follow SRRIP
++            rrpv[set][way] = maxRRPV - 1;
++    }
++    else if (leader == 0)
++    { // leader 0: BIP
++        if (PSEL[cpu] > 0)
++            PSEL[cpu]--;
++        rrpv[set][way] = maxRRPV;
++
++        bip_counter++;
++        if (bip_counter == BIP_MAX)
++            bip_counter = 0;
++        if (bip_counter == 0)
++            rrpv[set][way] = maxRRPV - 1;
++    }
++    else if (leader == 1)
++    { // leader 1: SRRIP
++        if (PSEL[cpu] < PSEL_MAX)
++            PSEL[cpu]++;
++        rrpv[set][way] = maxRRPV - 1;
++    }
++    else // WE SHOULD NOT REACH HERE
++        assert(0);
++}
++
++// find replacement victim
++uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
++{
++
++    uint32_t way = 0;
++    //check invalid block first            
++    for (way = 0; way < NUM_WAY; way++)
++    {
++        if (block[set][way].valid == false)
++        {
++            // cout << "invalid found" << endl;
++            return way;
++        }
++    }
++
++    int exist_only_in_LLC[LLC_WAY],exist_only_in_caller_L2[LLC_WAY];
++    //reset flags
++    for (int i = 0; i < LLC_WAY; i++){
++        exist_only_in_LLC[i] = 0;
++        exist_only_in_caller_L2[i]=0;
++    }
++    
++    int search_in_L2, current_cpu,present_in_L2_count=0,present_in_my_L2=0,present_in_my_L2_only=0,present_in_L2=0, present_in_LLC_only=0;
++  
++    for (way = 0; way < NUM_WAY; way++)
++    { 
++        present_in_L2_count=0, present_in_my_L2=0,present_in_L2 = 0;
++        for(current_cpu=0; current_cpu<NUM_CPUS; current_cpu++ )   
++        {
++            //Search a given LLC Block in all L2 caches
++            search_in_L2=(ooo_cpu[current_cpu].L2C.search_entry(block[set][way].address));
++            //block is found in L2
++            if(search_in_L2 == 1)
++            {
++                //Set flag that LLC block is found in any L2 
++                present_in_L2 = 1;
++                //increment present_in_L2_count to store num of L2 that contain that block 
++                present_in_L2_count++;
++                if(current_cpu==(int)cpu)
++                    present_in_my_L2=1;
++                                 
++            }    
++
++        }
++
++        //check if the block is not present in any L2
++        if(present_in_L2 == 0) 
++        {   
++            present_in_LLC_only = 1;
++            //Set that way is only in LLC                    
++            exist_only_in_LLC[way] = 1;
++        }
++
++        //the blocks that are only in Caller processor L2
++        if ((present_in_L2_count == 1) && (present_in_my_L2 == 1))
++        { 
++           exist_only_in_caller_L2[way] = 1;
++           present_in_my_L2_only=1;
++        }
++    }
++
++            
++    //CASE 1:find victim according to drrip algorithm by considering blocks that exist only in LLC  
++    if(present_in_LLC_only==1)
++    {        
++        while (1)
++        { 
++            for (int i = 0; i < LLC_WAY; i++) 
++            {
++                //if rrpv is maxRRPV and block is present in only LLC return way
++                if (rrpv[set][i] == maxRRPV && exist_only_in_LLC[i] == 1)
++                    return i;
++
++            }
++
++            for (int i = 0; i < LLC_WAY; i++)
++            {
++                //increment rrpv of block which is present in LLC only
++                if (exist_only_in_LLC[i] == 1)
++                    rrpv[set][i]++;
++            }
++
++              
++        }      
++    }
++    
++    //CASE 2:find victim according to drrip algorithm by considering blocks that exist only in caller's L2 cache
++    else  if (present_in_my_L2_only==1)
++    {
++        while (1)
++        {
++            //if rrpv is maxRRPV and block is present in only Caller L2 cache return way
++            for (int i = 0; i < LLC_WAY; i++){
++                if (rrpv[set][i] == maxRRPV && exist_only_in_caller_L2[i] == 1)
++                    return i;
++            }
++            
++            //increment rrpv of block which is present in caller L2 only
++            for (int i = 0; i < LLC_WAY; i++){
++                if (exist_only_in_caller_L2[i] == 1)
++                    rrpv[set][i]++;
++            }
++        }
++    }
++
++    //CASE3: call Normal drrip algo if CASE 1 and CASE 2 fails
++    while (1)
++    { 
++        for (int i = 0; i < LLC_WAY; i++)
++        {   
++            //check for the block with rrpv = maxRRPV, return way
++            if (rrpv[set][i] == maxRRPV)
++                return i;   
++        }
++        //increment the rrpv of all the blocks
++        for (int i = 0; i < LLC_WAY; i++)
++            rrpv[set][i]++;
++          
++    }   
++
++}
++
++
++// use this function to print out your own stats at the end of simulation
++void CACHE::llc_replacement_final_stats()
++{
++}
+diff -Naru ChampSim-master_orig/replacement/new_lru.llc_repl ChampSim-master/replacement/new_lru.llc_repl
+--- ChampSim-master_orig/replacement/new_lru.llc_repl	1970-01-01 05:30:00.000000000 +0530
++++ ChampSim-master/replacement/new_lru.llc_repl	2018-10-20 11:28:01.264555000 +0530
+@@ -0,0 +1,136 @@
++#include "cache.h"
++#include "ooo_cpu.h"
++// initialize replacement state
++void CACHE::llc_initialize_replacement()
++{
++
++}
++
++// find replacement victim
++uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
++{
++    uint32_t way = 0;
++
++    // fill invalid line first
++    for (way = 0; way < NUM_WAY; way++)
++    {
++        //return way containing invalid block
++        if (block[set][way].valid == false)
++            return way;
++        
++    }
++
++    int search_in_L2, present_in_L2, present_in_L2_count, present_in_my_L2, present_in_llc_only = 0, present_in_my_L2_only = 0;
++    int current_cpu, max_lru_llc_only = -1, max_lru_way_llc_only = -1, max_lru_my_l2_only = -1, max_lru_way_my_l2_only = -1;
++    for (way = 0; way < NUM_WAY; way++)
++    { 
++        present_in_L2=0, present_in_L2_count=0, present_in_my_L2=0;
++        for(current_cpu=0; current_cpu<NUM_CPUS; current_cpu++)   
++        {
++            //Search a given LLC Block in all L2 caches
++            search_in_L2 = (ooo_cpu[current_cpu].L2C.search_entry(block[set][way].address));
++         
++            if(search_in_L2) 
++            {   
++                //Set flag that LLC block is found in any L2      
++                present_in_L2=1;
++                //increment present_in_L2_count to store num of L2 that contain that block
++                present_in_L2_count++;
++                //check if LLC block exist in same processor's L2 cache which called llc_find_victim()
++                if( current_cpu == (int) cpu ) 
++                    present_in_my_L2 = 1;
++            }
++
++        }
++            
++        //CASE 1:find oldest LRU block from the blocks that are only in LLC
++        if(present_in_L2 == 0)
++        {
++            present_in_llc_only=1;
++
++            //set max lru and it's way from LLC only  
++            if (max_lru_llc_only < (int)block[set][way].lru)
++            {
++                max_lru_llc_only = block[set][way].lru;
++                max_lru_way_llc_only = way;
++            }
++               
++        }
++
++        //CASE 2:find oldest LRU block from the blocks that are only in Caller processor L2
++        if((present_in_L2_count == 1) && (present_in_my_L2 == 1)) {
++            //if its present in my L2 only
++            present_in_my_L2_only=1;
++            
++            if (max_lru_my_l2_only < (int) block[set][way].lru)
++            {
++                max_lru_my_l2_only = block[set][way].lru;
++                max_lru_way_my_l2_only = way;
++            }
++                         
++        }
++
++    }
++
++    //return way number depends on CASE 1 or CASE 2
++    if(present_in_llc_only)
++        return max_lru_way_llc_only;
++    else if(present_in_my_L2_only)  
++        return max_lru_way_my_l2_only; 
++          
++    //CASE 3: run normal LRU if CASE 1 and CASE 2 is false
++    for (way=0; way<NUM_WAY; way++) {
++        if (block[set][way].lru == NUM_WAY-1){
++            //if lru of block is NUM_WAY-1 break, so that way contains the LRU block
++            break;
++        }                      
++    }
++              
++    if (way == NUM_WAY)
++    {
++        cerr << "[" << NAME << "] " << __func__ << " no victim! set: " << set << endl;
++        assert(0);
++    } 
++    
++    return way; 
++        
++}
++
++// called on every cache hit and cache fill
++void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
++{
++    string TYPE_NAME;
++    if (type == LOAD)
++        TYPE_NAME = "LOAD";
++    else if (type == RFO)
++        TYPE_NAME = "RFO";
++    else if (type == PREFETCH)
++        TYPE_NAME = "PF";
++    else if (type == WRITEBACK)
++        TYPE_NAME = "WB";
++    else
++        assert(0);
++
++    if (hit)
++        TYPE_NAME += "_HIT";
++    else
++        TYPE_NAME += "_MISS";
++
++    if ((type == WRITEBACK) && ip)
++        assert(0);
++
++    // uncomment this line to see the LLC accesses
++    // cout << "CPU: " << cpu << "  LLC " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
++    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
++
++    // baseline LRU
++    if (hit && (type == WRITEBACK)) // writeback hit does not update LRU state
++        return;
++
++    return lru_update(set, way);
++}
++
++void CACHE::llc_replacement_final_stats()
++{
++
++}
+diff -Naru ChampSim-master_orig/replacement/new_srrip.llc_repl ChampSim-master/replacement/new_srrip.llc_repl
+--- ChampSim-master_orig/replacement/new_srrip.llc_repl	1970-01-01 05:30:00.000000000 +0530
++++ ChampSim-master/replacement/new_srrip.llc_repl	2018-10-20 19:06:44.412450000 +0530
+@@ -0,0 +1,178 @@
++#include "cache.h"
++#include "ooo_cpu.h"
++
++#define maxRRPV 3
++uint32_t rrpv[LLC_SET][LLC_WAY];
++
++// initialize replacement state
++void CACHE::llc_initialize_replacement()
++{
++    cout << "Initialize SRRIP state" << endl;
++
++    for (int i=0; i<LLC_SET; i++) {
++        for (int j=0; j<LLC_WAY; j++) {
++            rrpv[i][j] = maxRRPV;
++        }
++    }
++}
++
++// find replacement victim
++uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
++{
++
++    uint32_t way = 0;
++    //check invalid block first            
++    for (way = 0; way < NUM_WAY; way++)
++    {
++        if (block[set][way].valid == false)
++        {
++            // cout << "invalid found" << endl;
++            return way;
++        }
++    }
++
++    int exist_only_in_LLC[LLC_WAY],exist_only_in_caller_L2[LLC_WAY];
++    //reset flags
++    for (int i = 0; i < LLC_WAY; i++){
++        exist_only_in_LLC[i] = 0;
++        exist_only_in_caller_L2[i]=0;
++    }
++    
++    int search_in_L2, current_cpu,present_in_L2_count=0,present_in_my_L2=0,present_in_my_L2_only=0,present_in_L2=0, present_in_LLC_only=0;
++  
++    for (way = 0; way < NUM_WAY; way++)
++    { 
++        present_in_L2_count=0, present_in_my_L2=0,present_in_L2 = 0;
++        for(current_cpu=0; current_cpu<NUM_CPUS; current_cpu++ )   
++        {
++            //Search a given LLC Block in all L2 caches
++            search_in_L2=(ooo_cpu[current_cpu].L2C.search_entry(block[set][way].address));
++            //block is found in L2
++            if(search_in_L2 == 1)
++            {
++                //Set flag that LLC block is found in any L2 
++                present_in_L2 = 1;
++                //increment present_in_L2_count to store num of L2 that contain that block 
++                present_in_L2_count++;
++                if(current_cpu==(int)cpu)
++                    present_in_my_L2=1;
++                                 
++            }    
++
++        }
++
++        //check if the block is not present in any L2
++        if(present_in_L2 == 0) 
++        {   
++            present_in_LLC_only = 1;
++            //Set that way is only in LLC                    
++            exist_only_in_LLC[way] = 1;
++        }
++
++        //the blocks that are only in Caller processor L2
++        if ((present_in_L2_count == 1) && (present_in_my_L2 == 1))
++        { 
++           exist_only_in_caller_L2[way] = 1;
++           present_in_my_L2_only=1;
++        }
++    }
++
++            
++    //CASE 1:find victim according to srrip algorithm by considering blocks that exist only in LLC  
++    if(present_in_LLC_only==1)
++    {        
++        while (1)
++        { 
++            for (int i = 0; i < LLC_WAY; i++) 
++            {
++                //if rrpv is maxRRPV and block is present in only LLC return way
++                if (rrpv[set][i] == maxRRPV && exist_only_in_LLC[i] == 1)
++                    return i;
++
++            }
++
++            for (int i = 0; i < LLC_WAY; i++)
++            {
++                //increment rrpv of block which is present in LLC only
++                if (exist_only_in_LLC[i] == 1)
++                    rrpv[set][i]++;
++            }
++
++              
++        }      
++    }
++    
++    //CASE 2:find victim according to srrip algorithm by considering blocks that exist only in caller's L2 cache
++    else  if (present_in_my_L2_only==1)
++    {
++        while (1)
++        {
++            //if rrpv is maxRRPV and block is present in only Caller L2 cache return way
++            for (int i = 0; i < LLC_WAY; i++){
++                if (rrpv[set][i] == maxRRPV && exist_only_in_caller_L2[i] == 1)
++                    return i;
++            }
++            
++            //increment rrpv of block which is present in caller L2 only
++            for (int i = 0; i < LLC_WAY; i++){
++                if (exist_only_in_caller_L2[i] == 1)
++                    rrpv[set][i]++;
++            }
++        }
++    }
++
++    //CASE3: call Normal srrip algo if CASE 1 and CASE 2 fails
++    while (1)
++    { 
++        for (int i = 0; i < LLC_WAY; i++)
++        {   
++            //check for the block with rrpv = maxRRPV, return way
++            if (rrpv[set][i] == maxRRPV)
++                return i;   
++        }
++        //increment the rrpv of all the blocks
++        for (int i = 0; i < LLC_WAY; i++)
++            rrpv[set][i]++;
++          
++    }   
++
++}
++
++// called on every cache hit and cache fill
++void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
++{
++    string TYPE_NAME;
++    if (type == LOAD)
++        TYPE_NAME = "LOAD";
++    else if (type == RFO)
++        TYPE_NAME = "RFO";
++    else if (type == PREFETCH)
++        TYPE_NAME = "PF";
++    else if (type == WRITEBACK)
++        TYPE_NAME = "WB";
++    else
++        assert(0);
++
++    if (hit)
++        TYPE_NAME += "_HIT";
++    else
++        TYPE_NAME += "_MISS";
++
++    if ((type == WRITEBACK) && ip)
++        assert(0);
++
++    // uncomment this line to see the LLC accesses
++    // cout << "CPU: " << cpu << "  LLC " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
++    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
++    
++    if (hit)
++        rrpv[set][way] = 0;
++    else
++        rrpv[set][way] = maxRRPV-1;
++}
++
++// use this function to print out your own stats at the end of simulation
++void CACHE::llc_replacement_final_stats()
++{
++
++}
+diff -Naru ChampSim-master_orig/run_2core.sh ChampSim-master/run_2core.sh
+--- ChampSim-master_orig/run_2core.sh	1970-01-01 05:30:00.000000000 +0530
++++ ChampSim-master/run_2core.sh	2018-10-19 16:41:40.639979000 +0530
+@@ -0,0 +1,13 @@
++TRACE_DIR=../Traces
++binary=${1}
++n_warm=${2}
++n_sim=${3}
++trace1=${4}
++trace2=${5}
++option=${6}
++
++
++
++mkdir -p results_2core
++
++(./bin/${binary} -warmup_instructions ${n_warm}000000 -simulation_instructions ${n_sim}000000 ${option} -traces ${TRACE_DIR}/${trace1}.trace.gz ${TRACE_DIR}/${trace2}.trace.gz) &> results_2core/${trace1}-${trace2}-${binary}${option}.txt
+diff -Naru ChampSim-master_orig/run_champsim.sh ChampSim-master/run_champsim.sh
+--- ChampSim-master_orig/run_champsim.sh	1970-01-01 05:30:00.000000000 +0530
++++ ChampSim-master/run_champsim.sh	2018-10-19 15:37:42.499994000 +0530
+@@ -0,0 +1,9 @@
++TRACE_DIR=../Traces
++binary=${1}
++n_warm=${2}
++n_sim=${3}
++trace=${4}
++option=${5}
++
++mkdir -p results_${n_sim}M
++(./bin/${binary} -warmup_instructions ${n_warm}000000 -simulation_instructions ${n_sim}000000 ${option} -traces ${TRACE_DIR}/${trace}.trace.gz) &> results_${n_sim}M/${trace}-${binary}${option}.txt
+diff -Naru ChampSim-master_orig/src/cache.cc ChampSim-master/src/cache.cc
+--- ChampSim-master_orig/src/cache.cc	2018-01-23 23:23:54.000000000 +0530
++++ ChampSim-master/src/cache.cc	2018-10-21 01:50:15.319934268 +0530
+@@ -1,5 +1,6 @@
+ #include "cache.h"
+ #include "set.h"
++#include "ooo_cpu.h"
+ 
+ uint64_t l2pf_access = 0;
+ 
+@@ -19,10 +20,71 @@
+ 
+         uint32_t mshr_index = MSHR.next_fill_index;
+ 
++        uint64_t inval_addr;
++        int isInvalidated = -1, foundInL2 = 0, foundInL1 = 0;
++
+         // find victim
+         uint32_t set = get_set(MSHR.entry[mshr_index].address), way;
+         if (cache_type == IS_LLC) {
+             way = llc_find_victim(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
++            
++            //check if the block is valid, if yes then check at upper levels
++            if (block[set][way].valid != false) {
++                //Increment the total blocks evicted by cpu_fill
++                ooo_cpu[fill_cpu].LLCEvictionCount++;
++                //get block addr to be invalidated
++                inval_addr = block[set][way].address;
++                //Make the cache Inclusive by invalidating the inval_addr from upper levels
++                for (int cpu_id = 0; cpu_id < NUM_CPUS; cpu_id++)
++                {
++                    //Is invalidated in L2, invalidate_entry returns -1 if block not present in L2
++                    isInvalidated = ooo_cpu[cpu_id].L2C.invalidate_entry(inval_addr);
++                    //if the block was present in L2 invalidate check and invalidate L1
++                    if(isInvalidated != -1){
++
++                        //check cross-core evictions
++                        if(cpu_id != fill_cpu){
++                            ooo_cpu[fill_cpu].crossCoreEvictionCount++;
++                        }
++
++                        //increment L2 backhits only once for all L2 cache
++                        if(foundInL2 == 0){
++                            ooo_cpu[cpu_id].L2_BackHitCount++;
++                            foundInL2 = 1;
++                        }
++                        //Invalidate L1D
++                        isInvalidated = ooo_cpu[cpu_id].L1D.invalidate_entry(inval_addr);
++                        if((isInvalidated != -1) && (foundInL1 == 0)){
++                            ooo_cpu[cpu_id].L1_BackHitCount++;
++                            foundInL1 = 1;
++                        }
++
++                        //Invalidate L1I
++                        isInvalidated = ooo_cpu[cpu_id].L1I.invalidate_entry(inval_addr);
++                        if((isInvalidated != -1) && (foundInL1 == 0)){
++                            ooo_cpu[cpu_id].L1_BackHitCount++;
++                            foundInL1 =1;
++                        }
++
++                    }
++
++                }
++            }
++        }
++        //For L2 cache
++        else if(cache_type == IS_L2C) {
++            //find_victim
++            way = find_victim(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
++
++            if (block[set][way].valid != false) {
++                //get block addr to be invalidated
++                inval_addr = block[set][way].address;
++
++                //Make the cache Inclusive by invalidating the inval_addr from upper levels L1D & L1I
++                ooo_cpu[fill_cpu].L1D.invalidate_entry(inval_addr);
++                ooo_cpu[fill_cpu].L1I.invalidate_entry(inval_addr);
++                
++            }
+         }
+         else
+             way = find_victim(fill_cpu, MSHR.entry[mshr_index].instr_id, set, block[set], MSHR.entry[mshr_index].ip, MSHR.entry[mshr_index].full_addr, MSHR.entry[mshr_index].type);
+@@ -1384,3 +1446,28 @@
+ {
+     WQ.FULL++;
+ }
++
++//check if the inval_addr is present in the cache, If yes return 1 else return 0
++int CACHE::search_entry(uint64_t inval_addr)
++{
++    uint32_t set = get_set(inval_addr);
++
++    if (NUM_SET < set)
++    {
++        cerr << "[" << NAME << "_ERROR] " << __func__ << " invalid set index: " << set << " NUM_SET: " << NUM_SET;
++        cerr << " inval_addr: " << hex << inval_addr << dec << endl;
++        assert(0);
++    }
++
++    // search
++    for (uint32_t way = 0; way < NUM_WAY; way++)
++    {
++        if (block[set][way].valid && (block[set][way].tag == inval_addr))
++        {
++            //Found: return 1
++            return 1;
++        }
++    }
++    //Not found: return 0
++    return 0;
++}
+diff -Naru ChampSim-master_orig/src/main.cc ChampSim-master/src/main.cc
+--- ChampSim-master_orig/src/main.cc	2018-01-23 23:23:54.000000000 +0530
++++ ChampSim-master/src/main.cc	2018-10-21 01:40:09.079936580 +0530
+@@ -446,6 +446,29 @@
+     return pa;
+ }
+ 
++//Solution: PA-2_A
++void print_backhit_stats(){
++ 
++    for (int i=0; i<NUM_CPUS; i++) {
++        cout<<"\nPrinting BackHits Stats of CPU "<<i;
++        cout<<"\nTotal Eviction count in LLC : "<<ooo_cpu[i].LLCEvictionCount;    
++        cout<<"\nL1 BackHit: "<<ooo_cpu[i].L1_BackHitCount;
++        cout<<"\tL2 BackHit: "<<ooo_cpu[i].L2_BackHitCount;
++    }
++    cout<<endl;
++}
++
++//Solution: PA-2_B
++void print_crosscore_eviction_stats(){
++ 
++    for (int i=0; i<NUM_CPUS; i++) {
++        cout<<"\nPrinting Cross-Core Eviction count of CPU "<<i;
++        cout<<"\nCross-Core Eviction Count: "<<ooo_cpu[i].crossCoreEvictionCount;
++        
++    }
++    cout<<endl;
++}
++
+ int main(int argc, char** argv)
+ {
+ 	// interrupt signal hanlder
+@@ -845,6 +868,12 @@
+         }
+     }
+ 
++    //Printing Backhits count
++    print_backhit_stats();
++    
++    //Printing Cross-Core Eviction count
++    print_crosscore_eviction_stats();
++    
+     cout << endl << "Region of Interest Statistics" << endl;
+     for (uint32_t i=0; i<NUM_CPUS; i++) {
+         cout << endl << "CPU " << i << " cumulative IPC: " << ((float) ooo_cpu[i].finish_sim_instr / ooo_cpu[i].finish_sim_cycle); 
