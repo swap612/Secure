@@ -2,13 +2,6 @@
 Build :<br> ./build_champsim.sh bimodal no no lru 1
 <br>
 
-run: <br>
-Using script file:<br>
-./run_champsim.sh bimodal-no-no-lru-1core 1 10 trace-3
-<br>
-Directly running the binary<br>
-./bin/bimodal-no-no-lru-1core -warmup_instructions 100000 -simulation_instructions 1000000 -traces ./champsim.trace.gz
-<br>
 <pre>
 In this assignment, you will implement a LLC replacement policy (as discussed in the class) that
 prevents cross-core eviction attacks such as evict+reload and prime+probe.
@@ -40,3 +33,11 @@ D. [​ Show me something new: 5 points​ ] Enhance your policy so that perform
 be minimal.
 
 </pre>
+<br>
+run: <br>
+Using script file:<br>
+./run_champsim.sh bimodal-no-no-lru-1core 1 10 trace-3
+<br>
+Directly running the binary<br>
+./bin/bimodal-no-no-lru-1core -warmup_instructions 100000 -simulation_instructions 1000000 -traces ./champsim.trace.gz
+<br>
